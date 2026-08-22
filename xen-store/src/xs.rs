@@ -52,6 +52,53 @@ fn write_request<W: Write>(
     writer.write_all(payload)
 }
 
+enum XenStoreTransport {
+    Socket(UnixStream),
+}
+
+impl XenStoreTransport {
+    fn try_clone(&self) -> Result<Self, std::io::Error> {
+        match self {
+            Self::Socket(stream) => stream.try_clone().map(Self::Socket),
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Self::Socket(stream) => {
+                /*
+                 * Calling shutdown() on the socket will cause the blocking
+                 * read in thread_function() to return with an error, causing
+                 * the reader thread to stop.
+                 */
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl Read for XenStoreTransport {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+        match self {
+            Self::Socket(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl Write for XenStoreTransport {
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, std::io::Error> {
+        match self {
+            Self::Socket(stream) => stream.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Socket(stream) => stream.flush(),
+        }
+    }
+}
+
 fn queue_message(
     condvar: &Arc<(
         Mutex<VecDeque<Result<XenStoreMessage, std::io::Error>>>,
@@ -76,7 +123,7 @@ fn queue_message(
 }
 
 fn thread_function(
-    mut rx_socket: UnixStream,
+    mut rx_transport: XenStoreTransport,
     tx_eventfd: EventFd,
     reply_condvar: Arc<(
         Mutex<VecDeque<Result<XenStoreMessage, std::io::Error>>>,
@@ -102,7 +149,7 @@ fn thread_function(
                 )
             };
 
-            rx_socket.read_exact(xen_socket_reply_msg_slice)?;
+            rx_transport.read_exact(xen_socket_reply_msg_slice)?;
         }
 
         if xen_socket_reply_msg.r#type == XS_READ && xen_socket_reply_msg.len == 0 {
@@ -119,7 +166,7 @@ fn thread_function(
 
         buffer.resize(xen_socket_reply_msg.len as usize, 0);
 
-        rx_socket.read_exact(buffer.as_mut_slice())?;
+        rx_transport.read_exact(buffer.as_mut_slice())?;
 
         if xen_socket_reply_msg.r#type != XS_READ
             && xen_socket_reply_msg.r#type != XS_WRITE
@@ -173,14 +220,19 @@ pub struct XenStoreHandle {
         Mutex<VecDeque<Result<XenStoreMessage, std::io::Error>>>,
         Condvar,
     )>,
-    tx_socket: Mutex<UnixStream>,
+    tx_transport: Mutex<XenStoreTransport>,
     rx_eventfd: EventFd,
 }
 
 impl XenStoreHandle {
+    /// Connect to XenStore through a Unix domain socket.
     pub fn new() -> Result<Self, std::io::Error> {
-        let tx_socket = UnixStream::connect(XENSTORED_SOCKET)?;
-        let rx_socket = tx_socket.try_clone()?;
+        let transport = XenStoreTransport::Socket(UnixStream::connect(XENSTORED_SOCKET)?);
+        Self::from_transport(transport)
+    }
+
+    fn from_transport(tx_transport: XenStoreTransport) -> Result<Self, std::io::Error> {
+        let rx_transport = tx_transport.try_clone()?;
         let tx_eventfd = EventFd::new(EFD_SEMAPHORE)?;
         let rx_eventfd = tx_eventfd.try_clone()?;
         let reply_condvar = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
@@ -190,7 +242,7 @@ impl XenStoreHandle {
 
         let handler = thread::spawn(|| {
             thread_function(
-                rx_socket,
+                rx_transport,
                 tx_eventfd,
                 reply_condvar_cloned,
                 watch_condvar_cloned,
@@ -201,7 +253,7 @@ impl XenStoreHandle {
             handler: Some(handler),
             reply_condvar,
             watch_condvar,
-            tx_socket: Mutex::new(tx_socket),
+            tx_transport: Mutex::new(tx_transport),
             rx_eventfd,
         })
     }
@@ -210,10 +262,10 @@ impl XenStoreHandle {
         let xen_socket_msg = XenSocketMessage::new(r#type, payload.len())?;
         let (lock, cvar) = &*self.reply_condvar;
 
-        let mut tx_socket = self.tx_socket.lock().unwrap();
+        let mut tx_transport = self.tx_transport.lock().unwrap();
 
         // Serialize complete request/response transactions.
-        write_request(&mut *tx_socket, &xen_socket_msg, payload)?;
+        write_request(&mut *tx_transport, &xen_socket_msg, payload)?;
 
         let mut reply_vec = lock.lock().unwrap();
         while reply_vec.is_empty() {
@@ -311,15 +363,9 @@ impl XenStoreHandle {
 
 impl Drop for XenStoreHandle {
     fn drop(&mut self) {
-        let tx_socket = self.tx_socket.lock().unwrap();
+        let tx_transport = self.tx_transport.lock().unwrap();
 
-        /*
-         * Calling shutdown() on the socket will cause the blocking
-         * rx_socket in thread_function() to return with an error
-         * condition, something that will automatically break the
-         * loop and cause the thread to stop.
-         */
-        let _ = tx_socket.shutdown(Shutdown::Both);
+        tx_transport.shutdown();
 
         /* Wait for it to stop */
         let _ = self.handler.take().unwrap().join();
@@ -328,6 +374,8 @@ impl Drop for XenStoreHandle {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
 
     #[derive(Default)]
@@ -368,6 +416,44 @@ mod tests {
         expected.extend_from_slice(payload);
         assert_eq!(writer.bytes, expected);
         assert!(writer.write_calls > 2);
+        Ok(())
+    }
+
+    #[test]
+    fn unix_transport_round_trip() -> Result<(), std::io::Error> {
+        let (client, mut server) = UnixStream::pair()?;
+        let handle = XenStoreHandle::from_transport(XenStoreTransport::Socket(client))?;
+        // Keep the peer open until the handle shuts down its reader.
+        let (release_sender, release_receiver) = mpsc::channel();
+
+        let server_thread = thread::spawn(move || -> Result<(), std::io::Error> {
+            let mut request = XenSocketMessage::default();
+            // SAFETY: request provides exclusive storage for one XenSocketMessage.
+            let request_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    std::ptr::addr_of_mut!(request).cast(),
+                    mem::size_of::<XenSocketMessage>(),
+                )
+            };
+            server.read_exact(request_bytes)?;
+            assert_eq!(request.r#type, XS_READ);
+
+            let mut payload = vec![0; request.len as usize];
+            server.read_exact(&mut payload)?;
+            assert_eq!(payload, b"domid\0");
+
+            let response_payload = b"7\0";
+            let response = XenSocketMessage::new(XS_READ, response_payload.len())?;
+            server.write_all(message_bytes(&response))?;
+            server.write_all(response_payload)?;
+            release_receiver.recv().unwrap();
+            Ok(())
+        });
+
+        assert_eq!(handle.read_str("domid")?, "7\0");
+        drop(handle);
+        release_sender.send(()).unwrap();
+        server_thread.join().unwrap()?;
         Ok(())
     }
 }
