@@ -13,10 +13,12 @@
 use std::{
     collections::VecDeque,
     ffi::CString,
+    fs::{File, OpenOptions},
     io::{Error, ErrorKind, Read, Write},
     mem,
     net::Shutdown,
-    os::unix::{io::AsRawFd, net::UnixStream},
+    os::unix::{fs::OpenOptionsExt, io::AsRawFd, net::UnixStream},
+    path::Path,
     sync::{Arc, Condvar, Mutex},
     thread,
     thread::JoinHandle,
@@ -54,12 +56,37 @@ fn write_request<W: Write>(
 
 enum XenStoreTransport {
     Socket(UnixStream),
+    Device { file: File, stop_eventfd: EventFd },
+}
+
+fn default_transport(
+    socket_path: &Path,
+    device_path: &Path,
+) -> Result<XenStoreTransport, std::io::Error> {
+    UnixStream::connect(socket_path)
+        .map(XenStoreTransport::Socket)
+        .or_else(|_| {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(device_path)?;
+
+            Ok(XenStoreTransport::Device {
+                file,
+                stop_eventfd: EventFd::new(0)?,
+            })
+        })
 }
 
 impl XenStoreTransport {
     fn try_clone(&self) -> Result<Self, std::io::Error> {
         match self {
             Self::Socket(stream) => stream.try_clone().map(Self::Socket),
+            Self::Device { file, stop_eventfd } => Ok(Self::Device {
+                file: file.try_clone()?,
+                stop_eventfd: stop_eventfd.try_clone()?,
+            }),
         }
     }
 
@@ -73,6 +100,10 @@ impl XenStoreTransport {
                  */
                 let _ = stream.shutdown(Shutdown::Both);
             }
+            Self::Device { stop_eventfd, .. } => {
+                // Socket shutdown cannot wake this reader; use an eventfd.
+                let _ = stop_eventfd.write(1);
+            }
         }
     }
 }
@@ -81,6 +112,26 @@ impl Read for XenStoreTransport {
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
         match self {
             Self::Socket(stream) => stream.read(buffer),
+            Self::Device { file, stop_eventfd } => {
+                if buffer.is_empty() {
+                    // Do not poll for a zero-length read.
+                    return Ok(0);
+                }
+
+                // Poll for input or shutdown; repoll after transient read errors.
+                loop {
+                    if !wait_for_device_input(file, stop_eventfd)? {
+                        return Ok(0);
+                    }
+
+                    match file.read(buffer) {
+                        Err(error)
+                            if error.kind() == ErrorKind::Interrupted
+                                || error.kind() == ErrorKind::WouldBlock => {}
+                        result => return result,
+                    }
+                }
+            }
         }
     }
 }
@@ -89,12 +140,14 @@ impl Write for XenStoreTransport {
     fn write(&mut self, buffer: &[u8]) -> Result<usize, std::io::Error> {
         match self {
             Self::Socket(stream) => stream.write(buffer),
+            Self::Device { file, .. } => file.write(buffer),
         }
     }
 
     fn flush(&mut self) -> Result<(), std::io::Error> {
         match self {
             Self::Socket(stream) => stream.flush(),
+            Self::Device { file, .. } => file.flush(),
         }
     }
 }
@@ -120,6 +173,39 @@ fn queue_message(
 
     queue.push_back(message);
     cvar.notify_one();
+}
+
+fn wait_for_device_input(file: &File, stop_eventfd: &EventFd) -> Result<bool, std::io::Error> {
+    let poll_fd = |fd| libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let mut poll_fds = [poll_fd(file.as_raw_fd()), poll_fd(stop_eventfd.as_raw_fd())];
+
+    loop {
+        // SAFETY: poll_fds is valid for both entries during the call.
+        if unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) } < 0 {
+            match Error::last_os_error() {
+                error if error.kind() == ErrorKind::Interrupted => continue,
+                error => return Err(error),
+            }
+        }
+
+        // Give shutdown priority over pending input.
+        if poll_fds[1].revents & libc::POLLIN != 0 {
+            return Ok(false);
+        }
+
+        let revents = poll_fds[0].revents;
+        if revents & libc::POLLNVAL != 0 {
+            return Err(Error::from_raw_os_error(libc::EBADF));
+        }
+
+        if revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Ok(true);
+        }
+    }
 }
 
 fn thread_function(
@@ -225,9 +311,9 @@ pub struct XenStoreHandle {
 }
 
 impl XenStoreHandle {
-    /// Connect to XenStore through a Unix domain socket.
+    /// Connect to XenStore through a Unix domain socket or `/dev/xen/xenbus`.
     pub fn new() -> Result<Self, std::io::Error> {
-        let transport = XenStoreTransport::Socket(UnixStream::connect(XENSTORED_SOCKET)?);
+        let transport = default_transport(Path::new(XENSTORED_SOCKET), Path::new(XENBUS_DEVICE))?;
         Self::from_transport(transport)
     }
 
@@ -374,9 +460,22 @@ impl Drop for XenStoreHandle {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::{os::fd::OwnedFd, sync::mpsc, time::Duration};
+
+    use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
+
+    fn device_transport_from_stream(
+        stream: UnixStream,
+    ) -> Result<XenStoreTransport, std::io::Error> {
+        stream.set_nonblocking(true)?;
+
+        Ok(XenStoreTransport::Device {
+            file: File::from(OwnedFd::from(stream)),
+            stop_eventfd: EventFd::new(0)?,
+        })
+    }
 
     #[derive(Default)]
     struct ShortWriter {
@@ -454,6 +553,82 @@ mod tests {
         drop(handle);
         release_sender.send(()).unwrap();
         server_thread.join().unwrap()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_idle_device_handle_stops_reader() -> Result<(), std::io::Error> {
+        // Keep the peer open so shutdown alone stops the reader.
+        let (client, _server) = UnixStream::pair()?;
+        let handle = XenStoreHandle::from_transport(device_transport_from_stream(client)?)?;
+        drop(handle);
+        Ok(())
+    }
+
+    #[test]
+    fn device_read_stops_after_partial_data() -> Result<(), std::io::Error> {
+        let (client, mut server) = UnixStream::pair()?;
+        let transport = device_transport_from_stream(client)?;
+        let mut rx_transport = transport.try_clone()?;
+        let (read_sender, read_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+
+        let reader = thread::spawn(move || {
+            let mut buffer = [0; 4];
+            let read = rx_transport.read(&mut buffer).unwrap();
+            read_sender.send(read).unwrap();
+            let result = rx_transport.read_exact(&mut buffer[read..]);
+            result_sender.send((result, buffer)).unwrap();
+        });
+
+        server.write_all(b"ab")?;
+        assert_eq!(
+            read_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .map_err(|error| Error::new(ErrorKind::TimedOut, error))?,
+            2
+        );
+        transport.shutdown();
+
+        let (result, buffer) = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|error| Error::new(ErrorKind::TimedOut, error))?;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(&buffer[..2], b"ab");
+        reader.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn device_read_honors_shutdown_with_ready_input() -> Result<(), std::io::Error> {
+        let (client, mut server) = UnixStream::pair()?;
+        let transport = device_transport_from_stream(client)?;
+        let mut rx_transport = transport.try_clone()?;
+
+        server.write_all(b"abcd")?;
+        transport.shutdown();
+
+        let mut buffer = [0; 4];
+        assert_eq!(
+            rx_transport.read_exact(&mut buffer).unwrap_err().kind(),
+            ErrorKind::UnexpectedEof
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn default_transport_falls_back_to_device() -> Result<(), std::io::Error> {
+        let temp_dir = TempDir::new()?;
+        let socket_path = temp_dir.as_path().join("missing-socket");
+        let device_path = temp_dir.as_path().join("xenbus");
+        let _device = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&device_path)?;
+
+        let transport = default_transport(&socket_path, &device_path)?;
+        assert!(matches!(transport, XenStoreTransport::Device { .. }));
         Ok(())
     }
 }
