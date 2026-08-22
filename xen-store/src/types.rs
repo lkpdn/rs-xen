@@ -11,6 +11,7 @@
 use std::io;
 
 pub const XENSTORED_SOCKET: &str = "/var/run/xenstored/socket";
+pub const XENBUS_DEVICE: &str = "/dev/xen/xenbus";
 pub const XENSTORE_PAYLOAD_MAX: u32 = 4096;
 
 #[repr(C)]
